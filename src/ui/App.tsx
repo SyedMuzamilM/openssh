@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { v4 as uuid } from 'uuid';
 import {
   Box,
   Text,
@@ -51,8 +52,10 @@ const HELP_TEXT = [
   '     Use --config.KEY VALUE to provide arbitrary configuration entries.',
   '  status DEPLOYMENT_ID STATUS           Update deployment status',
   '  register-instance --id ID --provider PROVIDER --name NAME --region REGION --ip ADDRESS [--state STATE] [--key KEY_ID]',
-  '  ssh-command INSTANCE_ID               Display SSH command for an instance',
-  'Enter command mode by pressing : and exit with Esc.',
+  '  /create-instance NAME [ID] --provider PROVIDER --region REGION [--ip ADDRESS] [--key KEY_ID]',
+  '  /ssh-instance INSTANCE                Display SSH command for an instance',
+  '  /join-instance INSTANCE               Alias for /ssh-instance',
+  'Enter command mode by pressing : or / and exit with Esc.',
 ];
 
 export function App(): React.ReactNode {
@@ -67,7 +70,7 @@ export function App(): React.ReactNode {
     sshKeys: 0,
   });
   const [messages, setMessages] = useState<Message[]>([{
-    text: 'Press : to open the command palette. Use arrow keys to navigate panels.',
+    text: 'Press : or / to open the command palette. Use arrow keys to navigate panels.',
     level: 'info',
   }]);
   const [commandMode, setCommandMode] = useState(false);
@@ -111,8 +114,13 @@ export function App(): React.ReactNode {
     }
 
     const { command, args, options } = parsed;
+    const normalizedCommand = command.startsWith('/') ? command.slice(1) : command;
+    if (!normalizedCommand) {
+      pushMessage('No command provided.', 'error');
+      return;
+    }
     try {
-      switch (command) {
+      switch (normalizedCommand) {
         case 'help':
           HELP_TEXT.forEach((line) => pushMessage(line));
           break;
@@ -198,16 +206,21 @@ export function App(): React.ReactNode {
           pushMessage(`Deployment ${deploymentId} updated to ${status}.`, 'success');
           break;
         }
-        case 'register-instance': {
+        case 'register-instance':
+        case 'create-instance': {
           const provider = (options.provider ?? options.p ?? '') as CloudProvider;
-          const id = String(options.id ?? args[0] ?? '');
-          const name = String(options.name ?? options.n ?? '');
+          const providedName = (options.name ?? options.n ?? args[0]) as string | undefined;
+          const name = providedName?.trim() ?? '';
+          const id = String(options.id ?? args[1] ?? (name ? generateInstanceId(name) : ''));
           const region = String(options.region ?? options.r ?? '');
           const ipAddress = options.ip ? String(options.ip) : undefined;
           const state = options.state ? String(options.state) : 'running';
           const sshKeyId = options.key ? String(options.key) : undefined;
-          if (!id || !provider || !name || !region) {
-            throw new Error('id, provider, name, and region options are required.');
+          if (!provider || !name || !region) {
+            throw new Error('provider, name, and region options are required.');
+          }
+          if (!id) {
+            throw new Error('Unable to derive an instance id. Please specify --id explicitly.');
           }
           const instanceRecord: InstanceDescriptor = {
             id,
@@ -221,17 +234,20 @@ export function App(): React.ReactNode {
           };
           await registerInstance(instanceRecord);
           await refreshData();
-          pushMessage(`Instance ${id} registered.`, 'success');
+          pushMessage(`Instance ${name} registered with id ${id}.`, 'success');
           break;
         }
-        case 'ssh-command': {
-          const instanceId = args[0] ?? String(options.id ?? '');
-          if (!instanceId) {
-            throw new Error('Instance ID is required.');
+        case 'ssh-command':
+        case 'ssh-instance':
+        case 'join-instance': {
+          const identifier = args[0] ?? String(options.id ?? options.name ?? '');
+          if (!identifier) {
+            throw new Error('Instance identifier is required.');
           }
-          const commandLine = await buildSshCommandForInstance(instanceId);
+          const resolvedId = resolveInstanceIdentifier(identifier, instances);
+          const commandLine = await buildSshCommandForInstance(resolvedId);
           if (!commandLine) {
-            pushMessage(`Unable to build SSH command for ${instanceId}.`, 'error');
+            pushMessage(`Unable to build SSH command for ${identifier}.`, 'error');
           } else {
             pushMessage(`SSH command: ${commandLine}`);
           }
@@ -244,7 +260,7 @@ export function App(): React.ReactNode {
     } catch (error) {
       pushMessage(`Command error: ${(error as Error).message}`, 'error');
     }
-  }, [pushMessage, refreshData]);
+  }, [instances, pushMessage, refreshData]);
 
   useInput((input: string, key: InputKey) => {
     if (key.ctrl && input === 'c') {
@@ -280,6 +296,12 @@ export function App(): React.ReactNode {
     if (input === ':') {
       setCommandMode(true);
       setCommandBuffer('');
+      return;
+    }
+
+    if (input === '/') {
+      setCommandMode(true);
+      setCommandBuffer('/');
       return;
     }
 
@@ -427,11 +449,12 @@ interface CommandBarProps {
 }
 
 function CommandBar({ commandMode, buffer }: CommandBarProps): React.ReactNode {
+  const prefix = commandMode ? (buffer.startsWith('/') ? '/' : ':') : 'Command';
   return (
     <Box flexDirection="row" borderStyle="round" borderColor={commandMode ? 'cyan' : 'gray'} paddingX={1} paddingY={0}>
-      <Text {...(commandMode ? { color: 'cyan' as const } : {})}>{commandMode ? ':' : 'Command'}</Text>
+      <Text {...(commandMode ? { color: 'cyan' as const } : {})}>{prefix}</Text>
       <Spacer />
-      <Text>{commandMode ? buffer : 'Press : to enter a command'}</Text>
+      <Text>{commandMode ? buffer : 'Press : or / to enter a command'}</Text>
     </Box>
   );
 }
@@ -464,10 +487,13 @@ function DetailsBar({ panel, deployments, instances, sshKeys, selectedIndices }:
     if (instance) {
       title = `Instance ${instance.name}`;
       lines = [
+        `ID: ${instance.id}`,
         `Provider: ${instance.provider}`,
         `Region: ${instance.region}`,
         `State: ${instance.state}`,
         `IP: ${instance.ipAddress ?? 'unknown'}`,
+        `SSH key: ${instance.sshKeyId ?? 'default'}`,
+        `Slash: /ssh-instance ${instance.id}`,
       ];
     }
   } else if (panel === 'sshKeys') {
@@ -530,6 +556,38 @@ function getPanelLength(
     default:
       return 0;
   }
+}
+
+function resolveInstanceIdentifier(identifier: string, instances: InstanceDescriptor[]): string {
+  const trimmed = identifier.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  const matchById = instances.find((instance) => instance.id === trimmed);
+  if (matchById) {
+    return matchById.id;
+  }
+  const lower = trimmed.toLowerCase();
+  const matchByName = instances.find((instance) => instance.name?.toLowerCase() === lower);
+  if (matchByName) {
+    return matchByName.id;
+  }
+  return trimmed;
+}
+
+function generateInstanceId(name: string): string {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (normalized.length >= 3) {
+    return normalized;
+  }
+  if (normalized.length > 0) {
+    return `${normalized}-${uuid().slice(0, 8)}`;
+  }
+  return uuid();
 }
 
 function buildConfiguration(options: Record<string, string | boolean>): Record<string, unknown> {
